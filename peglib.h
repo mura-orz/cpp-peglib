@@ -97,7 +97,13 @@ inline size_t codepoint_length(const char *s8, size_t l) {
 
 inline size_t codepoint_count(const char *s8, size_t l) {
   size_t count = 0;
-  for (size_t i = 0; i < l; i += codepoint_length(s8 + i, l - i)) {
+  for (size_t i = 0; i < l;) {
+    auto len = codepoint_length(s8 + i, l - i);
+    if (len == 0) {
+      // Invalid UTF-8 byte, treat as single byte to avoid infinite loop
+      len = 1;
+    }
+    i += len;
     count++;
   }
   return count;
@@ -287,7 +293,8 @@ inline std::string resolve_escape_sequence(const char *s, size_t n) {
     auto ch = s[i];
     if (ch == '\\') {
       i++;
-      if (i == n) { throw std::runtime_error("Invalid escape sequence..."); }
+      assert(i < n);
+
       switch (s[i]) {
       case 'f':
         r += '\f';
@@ -1290,20 +1297,28 @@ private:
 
 class Character : public Ope, public std::enable_shared_from_this<Character> {
 public:
-  Character(char ch) : ch_(ch) {}
+  Character(char32_t ch) : ch_(ch) {}
 
   size_t parse_core(const char *s, size_t n, SemanticValues & /*vs*/,
                     Context &c, std::any & /*dt*/) const override {
-    if (n < 1 || s[0] != ch_) {
+    if (n < 1) {
       c.set_error_pos(s);
       return static_cast<size_t>(-1);
     }
-    return 1;
+
+    char32_t cp = 0;
+    auto len = decode_codepoint(s, n, cp);
+
+    if (cp != ch_) {
+      c.set_error_pos(s);
+      return static_cast<size_t>(-1);
+    }
+    return len;
   }
 
   void accept(Visitor &v) override;
 
-  char ch_;
+  char32_t ch_;
 };
 
 class AnyCharacter : public Ope,
@@ -1625,7 +1640,7 @@ ncls(const std::vector<std::pair<char32_t, char32_t>> &ranges,
   return std::make_shared<CharacterClass>(ranges, true, ignore_case);
 }
 
-inline std::shared_ptr<Ope> chr(char dt) {
+inline std::shared_ptr<Ope> chr(char32_t dt) {
   return std::make_shared<Character>(dt);
 }
 
@@ -3361,6 +3376,17 @@ private:
     Data() : grammar(std::make_shared<Grammar>()) {}
   };
 
+  class SyntaxErrorException : public std::runtime_error {
+  public:
+    SyntaxErrorException(const char *what_arg, std::pair<size_t, size_t> r)
+        : std::runtime_error(what_arg), r_(r) {}
+
+    std::pair<size_t, size_t> line_info() const { return r_; }
+
+  private:
+    std::pair<size_t, size_t> r_;
+  };
+
   void make_grammar() {
     // Setup PEG syntax parser
     g["Grammar"] <= seq(g["Spacing"], oom(g["Definition"]), g["EndOfFile"]);
@@ -3439,7 +3465,7 @@ private:
         cho(seq(g["Char"], chr('-'), npd(chr(']')), g["Char"]), g["Char"]);
 
     g["Char"] <=
-        cho(seq(chr('\\'), cls("fnrtv'\"[]\\^")),
+        cho(seq(chr('\\'), cls("fnrtv'\"[]\\^-")),
             seq(chr('\\'), cls("0-3"), cls("0-7"), cls("0-7")),
             seq(chr('\\'), cls("0-7"), opt(cls("0-7"))),
             seq(lit("\\x"), cls("0-9a-fA-F"), opt(cls("0-9a-fA-F"))),
@@ -3474,8 +3500,8 @@ private:
     ~g["LABEL"] <= seq(cho(chr('^'), lit(u8(u8"⇑"))), g["Spacing"]);
 
     ~g["Spacing"] <= zom(cho(g["Space"], g["Comment"]));
-    g["Comment"] <=
-        seq(chr('#'), zom(seq(npd(g["EndOfLine"]), dot())), g["EndOfLine"]);
+    g["Comment"] <= seq(chr('#'), zom(seq(npd(g["EndOfLine"]), dot())),
+                        opt(g["EndOfLine"]));
     g["Space"] <= cho(chr(' '), chr('\t'), g["EndOfLine"]);
     g["EndOfLine"] <= cho(lit("\r\n"), chr('\n'), chr('\r'));
     g["EndOfFile"] <= npd(dot());
@@ -3814,6 +3840,10 @@ private:
         auto s2 = std::any_cast<std::string>(vs[1]);
         auto cp1 = decode_codepoint(s1.data(), s1.length());
         auto cp2 = decode_codepoint(s2.data(), s2.length());
+        if (cp1 > cp2) {
+          throw SyntaxErrorException("characer range is out of order...",
+                                     vs.line_info());
+        }
         return std::pair(cp1, cp2);
       }
       case 1: {
@@ -4018,19 +4048,27 @@ private:
       }
     }
 
-    std::any dt = &data;
-    auto r = g["Grammar"].parse(s, n, dt, nullptr, log);
+    try {
+      std::any dt = &data;
+      auto r = g["Grammar"].parse(s, n, dt, nullptr, log);
 
-    if (!r.ret) {
-      if (log) {
-        if (r.error_info.message_pos) {
-          auto line = line_info(s, r.error_info.message_pos);
-          log(line.first, line.second, r.error_info.message,
-              r.error_info.label);
-        } else {
-          auto line = line_info(s, r.error_info.error_pos);
-          log(line.first, line.second, "syntax error", r.error_info.label);
+      if (!r.ret) {
+        if (log) {
+          if (r.error_info.message_pos) {
+            auto line = line_info(s, r.error_info.message_pos);
+            log(line.first, line.second, r.error_info.message,
+                r.error_info.label);
+          } else {
+            auto line = line_info(s, r.error_info.error_pos);
+            log(line.first, line.second, "syntax error", r.error_info.label);
+          }
         }
+        return {};
+      }
+    } catch (const SyntaxErrorException &e) {
+      if (log) {
+        auto line = e.line_info();
+        log(line.first, line.second, e.what(), "");
       }
       return {};
     }
@@ -4059,7 +4097,7 @@ private:
         if (log) {
           auto line = line_info(s, ptr);
           log(line.first, line.second,
-              "The definition '" + name + "' is already defined.", "");
+              "the definition '" + name + "' is already defined.", "");
         }
       }
       ret = false;
@@ -4071,7 +4109,7 @@ private:
         if (log) {
           auto line = line_info(s, ptr);
           log(line.first, line.second,
-              "The instruction '" + type + "' is already defined.", "");
+              "the instruction '" + type + "' is already defined.", "");
         }
       }
       ret = false;
@@ -4083,7 +4121,7 @@ private:
         if (log) {
           auto line = line_info(s, ptr);
           log(line.first, line.second,
-              "The back reference '" + name + "' is undefined.", "");
+              "the back reference '" + name + "' is undefined.", "");
         }
       }
       ret = false;
@@ -4099,7 +4137,7 @@ private:
         if (log) {
           auto line = line_info(s, s);
           log(line.first, line.second,
-              "The specified start rule '" + requested_start +
+              "the specified start rule '" + requested_start +
                   "' is undefined.",
               "");
         }
@@ -4117,7 +4155,7 @@ private:
         if (log) {
           auto line = line_info(s, start_rule.s_);
           log(line.first, line.second,
-              "Ignore operator cannot be applied to '" + start_rule.name + "'.",
+              "ignore operator cannot be applied to '" + start_rule.name + "'.",
               "");
         }
         ret = false;
